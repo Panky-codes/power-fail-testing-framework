@@ -1,0 +1,74 @@
+# Configuration for database atomic-support power-cycle testing.
+# Edit the connection details and task commands below for your target database.
+
+[connection]
+# Option 1 (Recommended): Use a Host alias defined in ~/.ssh/config (or /etc/ssh/ssh_config).
+# HostName, User, Port, IdentityFile, ProxyJump, etc. are loaded automatically.
+ssh_alias = "blixen"
+# Optional path to a custom ssh_config file if not using ~/.ssh/config:
+# ssh_config = "~/.ssh/config"
+
+# Option 2: Specify connection details explicitly instead of ssh_alias.
+# host = "192.168.1.50"
+# user = "root"
+# port = 22
+# ssh_key = "~/.ssh/id_ed25519"
+
+connect_timeout_sec = 10
+
+[loop]
+# 0 = run indefinitely until recovery fails or interrupted (Ctrl+C).
+max_iterations = 3
+
+# Maximum time to wait for remote SSH to come back online after power-on.
+boot_wait_timeout_sec = 300
+ssh_poll_interval_sec = 5
+
+# Default timeout for individual check / start / power commands.
+command_timeout_sec = 120
+
+# Optional brief pause after starting the DB before running the stability check.
+post_start_settle_sec = 30
+
+# Number of attempts for check_db_stable (1 = stop immediately on first failure).
+stability_retries = 3
+stability_retry_delay_sec = 5
+
+# Randomized time window (in seconds) to let sysbench run before cutting power.
+# Set min == max if you want a fixed duration instead of random jitter.
+workload_run_sec_min = 30
+workload_run_sec_max = 75
+
+# Seconds to keep chassis power off before issuing power-on.
+power_off_wait_sec = 15
+
+# Directory where per-run logs and crash diagnostics are stored.
+log_dir = "logs"
+
+[commands.remote]
+# Executed on the remote server via SSH.
+# Exit code 0 means success / healthy; non-zero means not running or failed.
+check_db_running = "podman exec mysql-noatom mysqladmin -u root -S /var/run/mysqld/mysqld.sock ping"
+start_db = "podman run --replace -d --name mysql-noatom -v /mnt/nonatomssd/mysql:/var/lib/mysql:Z --network=host mysql-atomic-sw mysqld --user=root --log-error-verbosity=3 --innodb_flush_method=O_DIRECT --innodb_io_capacity=20000 --innodb_io_capacity_max=40000"
+check_db_stable = "podman exec mysql-noatom mysqlcheck -u root -S /var/run/mysqld/mysqld.sock sbtest"
+# Optional regex matched against check_db_stable stdout/stderr (even when exit code is 0).
+# Halts immediately if matched (e.g., mysqlcheck reports 'Error : ...' / 'error : Corrupt').
+check_db_stable_fail_pattern = '(?im)^\s*error\s*:'
+run_workload = "DEVICE='/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_1TB_S6Z1NU0X263352V_1' MYSQL_CONTAINER='mysql-noatom' SB_THREADS=16 SB_TIME=600 SB_TABLE_SIZE=1000000 DB_NAME=sbtest ./mysql/bench.sh --skip-prepare"
+# Optional command run on the remote server in parallel with run_workload (e.g., to stress CPU / PSU load).
+# Leave empty ("") to skip.
+run_parallel_workload = "stress-ng --cpu 0 --timeout 600s"
+
+# Optional diagnostic command run on the remote server if start_db or check_db_stable fails.
+# Leave empty ("") to skip.
+collect_failure_logs = "podman logs mysql-noatom"
+
+[commands.local]
+# Executed locally on the orchestrator machine.
+power_cut = "ipmitool -I lanplus -H 106.110.32.60 -U ADMIN -P ADMIN chassis power off"
+
+# Optional check returning exit code 0 when chassis power is confirmed off.
+# Leave empty ("") to skip and rely solely on power_off_wait_sec.
+verify_power_off = "ipmitool -I lanplus -H 106.110.32.60 -U ADMIN -P ADMIN chassis power status | grep -qi 'is off'"
+
+power_on = "ipmitool -I lanplus -H 106.110.32.60 -U ADMIN -P ADMIN chassis power on"

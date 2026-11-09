@@ -1,0 +1,127 @@
+# Configuration for fio torn-write power-cycle testing (software atomic writes on /mnt/nonatomssd).
+# Uses fio --atomic=1 (RWF_ATOMIC via io_uring) with CRC32C block verification.
+
+[connection]
+# Option 1 (Recommended): Use a Host alias defined in ~/.ssh/config (or /etc/ssh/ssh_config).
+# HostName, User, Port, IdentityFile, ProxyJump, etc. are loaded automatically.
+ssh_alias = "blixen"
+# Optional path to a custom ssh_config file if not using ~/.ssh/config:
+# ssh_config = "~/.ssh/config"
+
+# Option 2: Specify connection details explicitly instead of ssh_alias.
+# host = "192.168.1.50"
+# user = "root"
+# port = 22
+# ssh_key = "~/.ssh/id_ed25519"
+
+connect_timeout_sec = 10
+
+[loop]
+# 0 = run indefinitely until verification fails or interrupted (Ctrl+C).
+max_iterations = 10
+
+# Maximum time to wait for remote SSH to come back online after power-on.
+boot_wait_timeout_sec = 300
+ssh_poll_interval_sec = 5
+
+# Default timeout for individual check / start / power commands.
+command_timeout_sec = 120
+
+# Brief pause after one-time file prefill before running verification.
+post_start_settle_sec = 1
+
+# Stop immediately on the first CRC32C verification failure.
+stability_retries = 1
+stability_retry_delay_sec = 5
+
+# Randomized time window (in seconds) to let fio run before cutting power.
+# Set min == max if you want a fixed duration instead of random jitter.
+workload_run_sec_min = 30
+workload_run_sec_max = 75
+
+# Seconds to keep chassis power off before issuing power-on.
+power_off_wait_sec = 15
+
+# Directory where per-run logs and crash diagnostics are stored.
+log_dir = "logs"
+
+[commands.remote]
+# 1. Check if the 1 GiB fio test file is already initialized on /mnt/nonatomssd.
+#    - Iteration 1 (if missing): triggers start_db to pre-fill valid 16 KiB CRC32C blocks.
+#    - Subsequent iterations (after power cuts): skips start_db so the crashed file is verified as-is.
+check_db_running = "mountpoint -q /mnt/nonatomssd && test -s /mnt/nonatomssd/fio_swatomic_testfile"
+
+# 2. One-time pre-fill using RWF_ATOMIC (--atomic=1 with io_uring) so every 16 KiB block
+#    is allocated with atomic write semantics and initialized with a valid CRC32C header.
+start_db = '''
+mountpoint -q /mnt/nonatomssd && \
+fio --name=prefill \
+  --filename=/mnt/nonatomssd/fio_swatomic_testfile \
+  --size=1G \
+  --rw=write \
+  --bs=16k \
+  --direct=1 \
+  --ioengine=io_uring \
+  --atomic=1 \
+  --verify=crc32c \
+  --do_verify=0 \
+  --randrepeat=0 \
+  --verify_state_save=0 && \
+sync /mnt/nonatomssd/fio_swatomic_testfile
+'''
+
+# 3. Post-crash verification: reads every 16 KiB block across all 1 GiB and fails (exit != 0)
+#    immediately if any 16 KiB block has a torn/mismatched CRC32C.
+check_db_stable = '''
+mountpoint -q /mnt/nonatomssd && \
+fio --name=verify_torn \
+  --filename=/mnt/nonatomssd/fio_swatomic_testfile \
+  --size=1G \
+  --rw=write \
+  --bs=16k \
+  --direct=1 \
+  --verify=crc32c \
+  --verify_only=1 \
+  --verify_header_seed=0 \
+  --verify_write_sequence=0 \
+  --verify_fatal=1
+'''
+check_db_stable_fail_pattern = ""
+
+# 4. High-concurrency 16 KiB random O_DIRECT + RWF_ATOMIC (--atomic=1) overwrite workload.
+#    8 jobs each write to a disjoint 128 MiB slice (8 x 128M = 1G) so host threads never overlap LBAs.
+run_workload = '''
+fio --name=hammer \
+  --filename=/mnt/nonatomssd/fio_swatomic_testfile \
+  --rw=randwrite \
+  --bs=16k \
+  --direct=1 \
+  --ioengine=io_uring \
+  --atomic=1 \
+  --iodepth=64 \
+  --numjobs=8 \
+  --size=128M \
+  --offset_increment=128M \
+  --time_based=1 \
+  --runtime=600 \
+  --norandommap=1 \
+  --randrepeat=0 \
+  --verify=crc32c \
+  --do_verify=0 \
+  --verify_state_save=0
+'''
+
+run_parallel_workload = "stress-ng --cpu 0 --timeout 600s"
+
+# Optional diagnostic command run on the remote server if start_db or check_db_stable fails.
+collect_failure_logs = "dmesg | tail -n 100"
+
+[commands.local]
+# Executed locally on the orchestrator machine.
+power_cut = "ipmitool -I lanplus -H 106.110.32.60 -U ADMIN -P ADMIN chassis power off"
+
+# Optional check returning exit code 0 when chassis power is confirmed off.
+# Leave empty ("") to skip and rely solely on power_off_wait_sec.
+verify_power_off = "ipmitool -I lanplus -H 106.110.32.60 -U ADMIN -P ADMIN chassis power status | grep -qi 'is off'"
+
+power_on = "ipmitool -I lanplus -H 106.110.32.60 -U ADMIN -P ADMIN chassis power on"
